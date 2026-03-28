@@ -29,42 +29,14 @@ import (
 	"github.com/pion/dtls/v3/pkg/crypto/selfsign"
 	"github.com/pion/logging"
 	"github.com/pion/turn/v5"
+	"github.com/rs/dnscache"
 )
 
 type getCredsFunc func(string) (string, string, string, error)
 
-func getVkCreds(link string) (string, string, string, error) {
-
-	dnsServers := []string{"77.88.8.8:53", "77.88.8.1:53"}
+func getVkCreds(link string, resolver *dnscache.Resolver) (string, string, string, error) {
 
 	doRequest := func(data string, url string) (resp map[string]interface{}, err error) {
-
-		resolver := &net.Resolver{
-			PreferGo: true,
-			Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
-				d := net.Dialer{
-					Timeout: 15 * time.Second,
-				}
-
-				for _, dnsServer := range dnsServers {
-					for i := 0; i < 3; i++ {
-						conn, err := d.DialContext(ctx, network, dnsServer)
-						if err == nil {
-							return conn, nil
-						}
-						time.Sleep(200 * time.Millisecond)
-					}
-				}
-
-				return d.DialContext(ctx, network, address)
-			},
-		}
-
-		dialer := &net.Dialer{
-			Timeout:   20 * time.Second,
-			KeepAlive: 30 * time.Second,
-			Resolver:  resolver,
-		}
 
 		client := &http.Client{
 			Timeout: 20 * time.Second,
@@ -72,7 +44,24 @@ func getVkCreds(link string) (string, string, string, error) {
 				MaxIdleConns:        100,
 				MaxIdleConnsPerHost: 100,
 				IdleConnTimeout:     90 * time.Second,
-				DialContext:         dialer.DialContext,
+				DialContext: func(ctx context.Context, network string, addr string) (conn net.Conn, err error) {
+					host, port, err := net.SplitHostPort(addr)
+					if err != nil {
+						return nil, err
+					}
+					ips, err := resolver.LookupHost(ctx, host)
+					if err != nil {
+						return nil, err
+					}
+					for _, ip := range ips {
+						var dialer net.Dialer
+						conn, err = dialer.DialContext(ctx, network, net.JoinHostPort(ip, port))
+						if err == nil {
+							break
+						}
+					}
+					return
+				},
 			},
 		}
 		defer client.CloseIdleConnections()
@@ -870,12 +859,42 @@ func main() { //nolint:cyclop
 	if (*vklink == "") == (*yalink == "") {
 		log.Panicf("Need either vk-link or yandex-link!")
 	}
+
 	var link string
 	var getCreds getCredsFunc
 	if *vklink != "" {
 		parts := strings.Split(*vklink, "join/")
 		link = parts[len(parts)-1]
-		getCreds = getVkCreds
+		dnsServers := []string{"77.88.8.8:53", "77.88.8.1:53"}
+		resolver := &dnscache.Resolver{
+			Resolver: &net.Resolver{
+				PreferGo: true,
+				Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
+
+					d := net.Dialer{
+						Timeout: 15 * time.Second,
+					}
+
+					for _, dnsServer := range dnsServers {
+						for i := 0; i < 3; i++ {
+							conn, err := d.DialContext(ctx, network, dnsServer)
+							if err != nil {
+								log.Printf("Failed to resolve addr: %s", err)
+								time.Sleep(200 * time.Millisecond)
+							} else {
+								return conn, nil
+							}
+						}
+					}
+
+					return d.DialContext(ctx, network, address)
+				},
+			},
+		}
+
+		getCreds = func(s string) (string, string, string, error) {
+			return getVkCreds(s, resolver)
+		}
 		if *n <= 0 {
 			*n = 16
 		}
@@ -919,7 +938,7 @@ func main() { //nolint:cyclop
 	}()
 
 	wg1 := sync.WaitGroup{}
-	t := time.Tick(100 * time.Millisecond)
+	t := time.Tick(200 * time.Millisecond)
 	if *direct {
 		for i := 0; i < *n; i++ {
 			wg1.Go(func() {
